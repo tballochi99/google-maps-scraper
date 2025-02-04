@@ -1,248 +1,277 @@
-const puppeteer = require("puppeteer")
-const fs = require("fs").promises
-const readline = require("readline")
+const puppeteer = require('puppeteer');
+const fs = require('fs').promises;
+const readline = require('readline');
+const { parse } = require('csv-parse');
+const { stringify } = require('csv-stringify');
 
-const fancyCredit = `
-╔════════════════════════════════════════════════════════════╗
-║                                                            ║
-║   ████████╗██╗███╗   ███╗ ██████╗ ████████╗███████╗        ║
-║   ╚══██╔══╝██║████╗ ████║██╔═══██╗╚══██╔══╝██╔════╝        ║
-║      ██║   ██║██╔████╔██║██║   ██║   ██║   █████╗          ║
-║      ██║   ██║██║╚██╔╝██║██║   ██║   ██║   ██╔══╝          ║
-║      ██║   ██║██║ ╚═╝ ██║╚██████╔╝   ██║   ███████╗        ║
-║      ╚═╝   ╚═╝╚═╝     ╚═╝ ╚═════╝    ╚═╝   ╚══════╝        ║
-║                                                            ║
-║                                                            ║
-║        Gloire à Timoté Ballochi pour ce scrapping          ║
-║                      de qualité !                          ║
-║                                                            ║
-╚════════════════════════════════════════════════════════════╝
-`
+const { cities, searchUrl } = require('./config');
+const CSV_FILE = 'establishments.csv';
+const CSV_HEADERS = ['name', 'phone', 'address', 'city', 'scrapedAt'];
 
-console.log(fancyCredit)
+class ScraperManager {
+  constructor() {
+    this.isRunning = true;
+    this.existingData = new Set();
+    this.stats = {
+      total: 0,
+      new: 0,
+      duplicates: 0,
+      errors: 0
+    };
+    this.currentCity = '';
+    this.browser = null;
+    this.page = null;
+  }
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-})
+  showBanner() {
+    console.log(`
+╔════════════════════════════════════════════════════╗
+║             SCRAPER GOOGLE MAPS v2.0               ║
+╠════════════════════════════════════════════════════╣
+║ Commandes disponibles:                             ║
+║ q: Quitter     p: Pause    r: Reprendre            ║
+║ s: Stats       c: Change ville                     ║
+║ d: Debug mode  h: Aide                             ║
+╚════════════════════════════════════════════════════╝
+    `);
+  }
 
-let isRunning = true
+  async setupConsoleCommands() {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
 
-function setupStopHandler() {
-  console.log('\n👉 Appuyez sur "q" puis Entrée pour arrêter le script à tout moment\n')
+    rl.on('line', async (input) => {
+      switch(input.toLowerCase()) {
+        case 'q':
+          console.log('\n🛑 Arrêt en cours...');
+          this.isRunning = false;
+          break;
+        case 'p':
+          this.isRunning = false;
+          console.log('⏸️ Pause');
+          break;
+        case 'r':
+          this.isRunning = true;
+          console.log('▶️ Reprise');
+          break;
+        case 's':
+          this.showStats();
+          break;
+        case 'd':
+          console.log('🔍 État actuel:', {
+            ville: this.currentCity,
+            ...this.stats,
+            isRunning: this.isRunning
+          });
+          break;
+        case 'h':
+          this.showBanner();
+          break;
+      }
+    });
+  }
 
-  rl.on("line", (input) => {
-    if (input.toLowerCase() === "q") {
-      console.log("\n🛑 Arrêt demandé. Finalisation du traitement en cours...")
-      isRunning = false
+  showStats() {
+    console.log(`
+📊 Statistiques:
+• Total établissements: ${this.stats.total}
+• Nouveaux ajoutés: ${this.stats.new}
+• Doublons évités: ${this.stats.duplicates}
+• Erreurs: ${this.stats.errors}
+• Ville en cours: ${this.currentCity}
+    `);
+  }
+
+  async initBrowser() {
+    this.browser = await puppeteer.launch({
+      headless: 'new',  // Plus rapide que headless: false
+      defaultViewport: { width: 1920, height: 1080 },
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--window-size=1920,1080'
+      ]
+    });
+    this.page = await this.browser.newPage();
+    
+    // Optimisations de performance
+    await this.page.setRequestInterception(true);
+    this.page.on('request', (req) => {
+      if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36');
+  }
+
+  async loadExistingData() {
+    try {
+      const fileExists = await fs.access(CSV_FILE).then(() => true).catch(() => false);
+      if (!fileExists) {
+        await fs.writeFile(CSV_FILE, CSV_HEADERS.join(',') + '\n');
+        return;
+      }
+
+      const fileContent = await fs.readFile(CSV_FILE, 'utf-8');
+      const records = await new Promise((resolve) => {
+        const results = [];
+        parse(fileContent, { columns: true })
+          .on('data', (data) => {
+            this.existingData.add(`${data.name}-${data.address}`);
+            results.push(data);
+          })
+          .on('end', () => resolve(results));
+      });
+      
+      this.stats.total = records.length;
+      console.log(`📂 ${records.length} établissements chargés du CSV`);
+    } catch (error) {
+      console.error('❌ Erreur chargement données:', error.message);
     }
-  })
-}
-
-async function delay(time) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, time)
-  })
-}
-
-async function loadExistingData() {
-  try {
-    const fileContent = await fs.readFile("establishments.json", "utf-8")
-    const parsedContent = JSON.parse(fileContent)
-    return parsedContent.data || []
-  } catch (error) {
-    return []
   }
-}
 
-async function saveEstablishment(establishment, existingData) {
-  const isDuplicate = existingData.some(
-    (existing) => existing.name === establishment.name && existing.address === establishment.address,
-  )
+  async saveEstablishment(establishment) {
+    const key = `${establishment.name}-${establishment.address}`;
+    if (this.existingData.has(key)) {
+      this.stats.duplicates++;
+      return false;
+    }
 
-  if (!isDuplicate && establishment.name !== "Résultats") {
-    existingData.push(establishment)
+    try {
+      const newRow = {
+        ...establishment,
+        scrapedAt: new Date().toISOString()
+      };
 
-    await fs.writeFile(
-      "establishments.json",
-      JSON.stringify(
-        {
-          credit: "Gloire à Timoté",
-          data: existingData,
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    )
-    return true
+      const csvLine = await new Promise((resolve) => {
+        stringify([newRow], { header: false }, (err, output) => resolve(output));
+      });
+
+      await fs.appendFile(CSV_FILE, csvLine);
+      this.existingData.add(key);
+      this.stats.new++;
+      this.stats.total++;
+      return true;
+    } catch (error) {
+      console.error('❌ Erreur sauvegarde:', error.message);
+      this.stats.errors++;
+      return false;
+    }
   }
-  return false
-}
 
-async function scrapeGoogleMaps() {
-  const browser = await puppeteer.launch({
-    headless: false,
-    defaultViewport: null,
-    args: ["--start-maximized"],
-  })
+  async processEstablishment(element) {
+    try {
+      const data = await this.page.evaluate(async (el) => {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        el.click();
+        await new Promise(resolve => setTimeout(resolve, 500));
 
-  const existingData = await loadExistingData()
-  console.log(`📊 ${existingData.length} établissements déjà enregistrés\n`)
+        const info = {
+          name: document.querySelector('.DUwDvf')?.textContent?.trim() || '',
+          phone: '',
+          address: ''
+        };
 
-  setupStopHandler()
+        document.querySelectorAll('.Io6YTe').forEach(el => {
+          const text = el.textContent.trim();
+          if (text.match(/^\+33|^0[1-9]/)) info.phone = text;
+          else if (text.includes('France') || text.match(/\d{5}/)) info.address = text;
+        });
 
-  try {
-    const page = await browser.newPage()
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    )
+        document.querySelector('button[jsaction="pane.back"]')?.click();
+        return info;
+      }, element);
 
-    // Liste des grandes villes françaises à parcourir
-    const cities = [
-      "Paris",
-      "Marseille",
-      "Lyon",
-      "Toulouse",
-      "Nice",
-      "Nantes",
-      "Strasbourg",
-      "Montpellier",
-      "Bordeaux",
-      "Lille",
-      "Rennes",
-      "Reims",
-      "Le Havre",
-      "Saint-Étienne",
-      "Toulon",
-      "Grenoble",
-      "Dijon",
-      "Angers",
-      "Nîmes",
-      "Villeurbanne",
-    ]
+      if (data.name && data.address && data.phone) {
+        data.city = this.currentCity;
+        await this.saveEstablishment(data);
+        process.stdout.write(`\r✅ ${this.stats.new} établissements traités`);
+      }
+    } catch (error) {
+      this.stats.errors++;
+      process.stdout.write('\r❌ Erreur traitement établissement');
+    }
+  }
 
-    for (const city of cities) {
-      if (!isRunning) break
+  async scrapeCity(city) {
+    try {
+      this.currentCity = city;
+      console.log(`\n🏙️ Traitement de ${city}`);
+  
+      await this.page.goto(`${searchUrl}${encodeURIComponent(city)}`, {
+        waitUntil: 'networkidle0',
+        timeout: 90000
+      });
 
-      console.log(`🏙️ Recherche dans : ${city}`)
-      await page.goto(`https://www.google.fr/maps/search/salle+de+jeu+et+de+divertissement+${city}`, {
-        waitUntil: "networkidle0",
-      })
-
+      // Gestion cookie si nécessaire
       try {
-        await page.waitForSelector('form:has(button[aria-label="Tout refuser"])', { timeout: 5000 })
-        const refuseButton = await page.$('button[aria-label="Tout refuser"]')
-        if (refuseButton) {
-          await refuseButton.click()
-          await delay(2000)
+        await this.page.waitForSelector('form:has(button[aria-label="Tout refuser"])', { timeout: 5000 });
+        await this.page.click('button[aria-label="Tout refuser"]');
+        await new Promise(r => setTimeout(r, 1000));
+      } catch {}
+
+      let lastCount = 0;
+      let sameCountIterations = 0;
+
+      while (this.isRunning && sameCountIterations < 3) {
+        const elements = await this.page.$$('.hfpxzc');
+        
+        if (elements.length === lastCount) {
+          sameCountIterations++;
+        } else {
+          sameCountIterations = 0;
+          lastCount = elements.length;
         }
-      } catch {
-        console.log("ℹ️ Pas de formulaire de consentement ou déjà accepté\n")
-      }
 
-      console.log("🔄 Chargement des résultats...\n")
-      await page.waitForSelector(".hfpxzc", { timeout: 15000 })
-
-      const processedEstablishments = new Set()
-      let noNewEstablishmentsCount = 0
-      let scrollCount = 0
-
-      while (isRunning && noNewEstablishmentsCount < 3 && scrollCount < 10) {
-        try {
-          const newEstablishments = await page.evaluate(async () => {
-            const establishments = []
-            const elements = document.querySelectorAll(".hfpxzc")
-
-            for (const element of elements) {
-              element.scrollIntoView({ behavior: "smooth", block: "center" })
-              await new Promise((resolve) => setTimeout(resolve, 500))
-
-              element.click()
-              await new Promise((resolve) => setTimeout(resolve, 1000))
-
-              const title = document.querySelector(".DUwDvf")?.textContent?.trim() || ""
-              const infoElements = Array.from(document.getElementsByClassName("Io6YTe"))
-
-              let phone = ""
-              let address = ""
-
-              infoElements.forEach((element) => {
-                const text = element.textContent.trim()
-                if (text.match(/^\+33|^0[1-9]/)) phone = text
-                else if (text.includes("France") || text.match(/\d{5}/)) address = text
-              })
-
-              if (title && title !== "Résultats" && address && phone) {
-                establishments.push({ name: title, phone, address })
-              }
-
-              const backButton = document.querySelector('button[jsaction="pane.back"]')
-              if (backButton) backButton.click()
-              await new Promise((resolve) => setTimeout(resolve, 500))
-            }
-
-            return establishments
-          })
-
-          let foundNewEstablishment = false
-
-          for (const establishmentInfo of newEstablishments) {
-            const establishmentKey = `${establishmentInfo.name}-${establishmentInfo.address}`
-            if (!processedEstablishments.has(establishmentKey)) {
-              process.stdout.write("\x1b[2J\x1b[0f") // Nettoie la console
-              console.log("🔄 Scraping en cours... (q + Entrée pour arrêter)\n")
-              console.log("📍 Établissement en cours :", establishmentInfo)
-
-              const saved = await saveEstablishment(establishmentInfo, existingData)
-              if (saved) {
-                console.log("✅ Enregistré ! Total :", existingData.length, "établissements\n")
-                processedEstablishments.add(establishmentKey)
-                foundNewEstablishment = true
-              } else {
-                console.log("⚠️ Doublon détecté ou nom invalide - non enregistré\n")
-              }
-            }
-          }
-
-          if (!foundNewEstablishment) {
-            noNewEstablishmentsCount++
-          } else {
-            noNewEstablishmentsCount = 0
-          }
-
-          if (!isRunning) break
-
-          // Faire défiler pour charger plus de résultats
-          await page.evaluate(() => {
-            const resultsList = document.querySelector(".m6QErb")
-            if (resultsList) {
-              resultsList.scrollTop = resultsList.scrollHeight
-            }
-          })
-
-          await delay(2000)
-          scrollCount++
-        } catch (error) {
-          console.error("Erreur lors du scraping :", error)
-          if (!isRunning) break
-          await delay(1000)
+        for (const element of elements) {
+          if (!this.isRunning) break;
+          await this.processEstablishment(element);
         }
-      }
 
-      console.log(`Fin du scraping pour ${city}. Passage à la ville suivante.\n`)
+        await this.page.evaluate(() => {
+          const resultsList = document.querySelector('.m6QErb');
+          if (resultsList) resultsList.scrollTop = resultsList.scrollHeight;
+        });
+
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    } catch (error) {
+      console.error(`\n❌ Erreur pour ${city}:`, error.message);
+      this.stats.errors++;
     }
+  }
 
-    console.log("\n✨ Scraping terminé !")
-    console.log(`📊 Total final : ${existingData.length} établissements dans le fichier\n`)
-  } catch (error) {
-    console.error("❌ Erreur principale:", error)
-  } finally {
-    await browser.close()
-    rl.close()
+  async start() {
+    try {
+      this.showBanner();
+      await this.setupConsoleCommands();
+      await this.loadExistingData();
+      await this.initBrowser();
+
+      for (const city of cities) {
+        if (!this.isRunning) break;
+        await this.scrapeCity(city);
+      }      
+    } catch (error) {
+      console.error('❌ Erreur critique:', error.message);
+    } finally {
+      if (this.browser) await this.browser.close();
+      this.showStats();
+      console.log('\n✨ Scraping terminé');
+      process.exit(0);
+    }
   }
 }
 
-scrapeGoogleMaps()
+new ScraperManager().start();
 
-console.log('Script lancé et gloire à . Appuyez sur "q" puis Entrée pour arrêter à tout moment.')
+
