@@ -86,7 +86,7 @@ class ScraperManager {
 
   async initBrowser() {
     this.browser = await puppeteer.launch({
-      headless: 'new',  // Plus rapide que headless: false
+      headless: 'new',
       defaultViewport: { width: 1920, height: 1080 },
       args: [
         '--no-sandbox',
@@ -99,7 +99,7 @@ class ScraperManager {
     });
     this.page = await this.browser.newPage();
     
-    // Optimisations de performance
+    
     await this.page.setRequestInterception(true);
     this.page.on('request', (req) => {
       if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
@@ -212,7 +212,7 @@ class ScraperManager {
         timeout: 90000
       });
 
-      // Gestion cookie si nécessaire
+      
       try {
         await this.page.waitForSelector('form:has(button[aria-label="Tout refuser"])', { timeout: 5000 });
         await this.page.click('button[aria-label="Tout refuser"]');
