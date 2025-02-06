@@ -1,36 +1,42 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const fs = require('fs').promises;
 const readline = require('readline');
 const { parse } = require('csv-parse');
-const { stringify } = require('csv-stringify');
-
+const { stringify } = require('csv-stringify/sync');
 const { cities, searchUrl } = require('./config');
+
 const CSV_FILE = 'establishments.csv';
 const CSV_HEADERS = ['name', 'phone', 'address', 'city', 'scrapedAt'];
+const MAX_DUPLICATES = 100;
+const MAX_RETRIES = 3;
 
 class ScraperManager {
   constructor() {
     this.isRunning = true;
-    this.existingData = new Set();
+    this.existingData = new Map();
     this.stats = {
       total: 0,
       new: 0,
       duplicates: 0,
-      errors: 0
+      errors: 0,
+      retries: 0
     };
     this.currentCity = '';
     this.browser = null;
     this.page = null;
+    this.cityQueue = [...cities];
   }
 
   showBanner() {
     console.log(`
 ╔════════════════════════════════════════════════════╗
-║             SCRAPER GOOGLE MAPS v2.0               ║
+║             SCRAPER GOOGLE MAPS v3.0               ║
 ╠════════════════════════════════════════════════════╣
 ║ Commandes disponibles:                             ║
 ║ q: Quitter     p: Pause    r: Reprendre            ║
-║ s: Stats       c: Change ville                     ║
+║ s: Stats       n: Ville suivante                   ║
 ║ d: Debug mode  h: Aide                             ║
 ╚════════════════════════════════════════════════════╝
     `);
@@ -59,11 +65,16 @@ class ScraperManager {
         case 's':
           this.showStats();
           break;
+        case 'n':
+          console.log('⏭️ Passage à la ville suivante');
+          this.moveToNextCity();
+          break;
         case 'd':
           console.log('🔍 État actuel:', {
             ville: this.currentCity,
             ...this.stats,
-            isRunning: this.isRunning
+            isRunning: this.isRunning,
+            villesRestantes: this.cityQueue.length
           });
           break;
         case 'h':
@@ -80,7 +91,9 @@ class ScraperManager {
 • Nouveaux ajoutés: ${this.stats.new}
 • Doublons évités: ${this.stats.duplicates}
 • Erreurs: ${this.stats.errors}
+• Tentatives de récupération: ${this.stats.retries}
 • Ville en cours: ${this.currentCity}
+• Villes restantes: ${this.cityQueue.length}
     `);
   }
 
@@ -98,7 +111,6 @@ class ScraperManager {
       ]
     });
     this.page = await this.browser.newPage();
-    
     
     await this.page.setRequestInterception(true);
     this.page.on('request', (req) => {
@@ -121,18 +133,17 @@ class ScraperManager {
       }
 
       const fileContent = await fs.readFile(CSV_FILE, 'utf-8');
-      const records = await new Promise((resolve) => {
-        const results = [];
+      await new Promise((resolve) => {
         parse(fileContent, { columns: true })
           .on('data', (data) => {
-            this.existingData.add(`${data.name}-${data.address}`);
-            results.push(data);
+            const key = `${data.name}-${data.address}`;
+            this.existingData.set(key, data);
           })
-          .on('end', () => resolve(results));
+          .on('end', resolve);
       });
       
-      this.stats.total = records.length;
-      console.log(`📂 ${records.length} établissements chargés du CSV`);
+      this.stats.total = this.existingData.size;
+      console.log(`📂 ${this.stats.total} établissements chargés du CSV`);
     } catch (error) {
       console.error('❌ Erreur chargement données:', error.message);
     }
@@ -151,12 +162,9 @@ class ScraperManager {
         scrapedAt: new Date().toISOString()
       };
 
-      const csvLine = await new Promise((resolve) => {
-        stringify([newRow], { header: false }, (err, output) => resolve(output));
-      });
-
+      const csvLine = stringify([newRow], { header: false });
       await fs.appendFile(CSV_FILE, csvLine);
-      this.existingData.add(key);
+      this.existingData.set(key, newRow);
       this.stats.new++;
       this.stats.total++;
       return true;
@@ -178,7 +186,8 @@ class ScraperManager {
         const info = {
           name: document.querySelector('.DUwDvf')?.textContent?.trim() || '',
           phone: '',
-          address: ''
+          address: '',
+          website: ''
         };
 
         document.querySelectorAll('.Io6YTe').forEach(el => {
@@ -187,11 +196,16 @@ class ScraperManager {
           else if (text.includes('France') || text.match(/\d{5}/)) info.address = text;
         });
 
+        info.website = document.querySelector('a[data-item-id="authority"]')?.href || '';
+
         document.querySelector('button[jsaction="pane.back"]')?.click();
         return info;
-      }, element);
+      }, element).catch(e => {
+        console.error('Erreur lors de l\'évaluation de l\'élément:', e.message);
+        return null;
+      });
 
-      if (data.name && data.address && data.phone) {
+      if (data && data.name && data.address) {
         data.city = this.currentCity;
         await this.saveEstablishment(data);
         process.stdout.write(`\r✅ ${this.stats.new} établissements traités`);
@@ -202,51 +216,85 @@ class ScraperManager {
     }
   }
 
-  async scrapeCity(city) {
+  moveToNextCity() {
+    this.cityQueue.shift();
+    this.stats.duplicates = 0;
+    if (this.cityQueue.length > 0) {
+      this.currentCity = this.cityQueue[0];
+      console.log(`\n🏙️ Passage à la ville suivante: ${this.currentCity}`);
+    } else {
+      console.log('\n🏁 Toutes les villes ont été traitées');
+      this.isRunning = false;
+    }
+  }
+
+  async scrapeCity(city, retryCount = 0) {
     try {
       this.currentCity = city;
-      console.log(`\n🏙️ Traitement de ${city}`);
+      console.log(`\n🏙️ Traitement de ${city} (Tentative ${retryCount + 1}/${MAX_RETRIES})`);
   
       await this.page.goto(`${searchUrl}${encodeURIComponent(city)}`, {
         waitUntil: 'networkidle0',
         timeout: 90000
       });
 
-      
+      // Handle cookie consent
       try {
         await this.page.waitForSelector('form:has(button[aria-label="Tout refuser"])', { timeout: 5000 });
         await this.page.click('button[aria-label="Tout refuser"]');
         await new Promise(r => setTimeout(r, 1000));
-      } catch {}
+      } catch (cookieError) {
+        console.log('Pas de bannière de cookies ou erreur lors de la gestion des cookies');
+      }
 
       let lastCount = 0;
       let sameCountIterations = 0;
 
-      while (this.isRunning && sameCountIterations < 3) {
-        const elements = await this.page.$$('.hfpxzc');
-        
-        if (elements.length === lastCount) {
-          sameCountIterations++;
-        } else {
-          sameCountIterations = 0;
-          lastCount = elements.length;
+      while (this.isRunning && sameCountIterations < 3 && this.stats.duplicates < MAX_DUPLICATES) {
+        try {
+          const elements = await this.page.$$('.hfpxzc');
+          
+          if (elements.length === lastCount) {
+            sameCountIterations++;
+          } else {
+            sameCountIterations = 0;
+            lastCount = elements.length;
+          }
+
+          for (const element of elements) {
+            if (!this.isRunning || this.stats.duplicates >= MAX_DUPLICATES) break;
+            await this.processEstablishment(element);
+          }
+
+          await this.page.evaluate(() => {
+            const resultsList = document.querySelector('.m6QErb');
+            if (resultsList) resultsList.scrollTop = resultsList.scrollHeight;
+          });
+
+          await new Promise(r => setTimeout(r, 1000 + Math.random() * 1000));
+        } catch (scrollError) {
+          console.error(`Erreur lors du défilement: ${scrollError.message}`);
+          break;
         }
+      }
 
-        for (const element of elements) {
-          if (!this.isRunning) break;
-          await this.processEstablishment(element);
-        }
-
-        await this.page.evaluate(() => {
-          const resultsList = document.querySelector('.m6QErb');
-          if (resultsList) resultsList.scrollTop = resultsList.scrollHeight;
-        });
-
-        await new Promise(r => setTimeout(r, 1000));
+      if (this.stats.duplicates >= MAX_DUPLICATES) {
+        console.log(`\n🔄 ${MAX_DUPLICATES} doublons atteints pour ${city}`);
+        this.moveToNextCity();
       }
     } catch (error) {
       console.error(`\n❌ Erreur pour ${city}:`, error.message);
       this.stats.errors++;
+      
+      if (retryCount < MAX_RETRIES - 1) {
+        console.log(`Tentative de récupération... (${retryCount + 1}/${MAX_RETRIES})`);
+        this.stats.retries++;
+        await this.initBrowser();
+        await this.scrapeCity(city, retryCount + 1);
+      } else {
+        console.log(`Échec après ${MAX_RETRIES} tentatives pour ${city}. Passage à la ville suivante.`);
+        this.moveToNextCity();
+      }
     }
   }
 
@@ -257,10 +305,11 @@ class ScraperManager {
       await this.loadExistingData();
       await this.initBrowser();
 
-      for (const city of cities) {
-        if (!this.isRunning) break;
-        await this.scrapeCity(city);
-      }      
+      while (this.cityQueue.length > 0 && this.isRunning) {
+        await this.scrapeCity(this.cityQueue[0]);
+        // Add a random delay between cities to avoid rate limiting
+        await new Promise(r => setTimeout(r, 5000 + Math.random() * 5000));
+      }
     } catch (error) {
       console.error('❌ Erreur critique:', error.message);
     } finally {
@@ -273,5 +322,3 @@ class ScraperManager {
 }
 
 new ScraperManager().start();
-
-
