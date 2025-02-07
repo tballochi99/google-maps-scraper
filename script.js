@@ -9,8 +9,9 @@ const { cities, searchUrl } = require('./config');
 
 const CSV_FILE = 'establishments.csv';
 const CSV_HEADERS = ['name', 'phone', 'address', 'city', 'scrapedAt'];
-const MAX_DUPLICATES = 100;
+const MAX_DUPLICATES = 50;
 const MAX_RETRIES = 3;
+const CONCURRENT_CITIES = 3; // Nombre de villes à traiter en parallèle
 
 class ScraperManager {
   constructor() {
@@ -23,10 +24,8 @@ class ScraperManager {
       errors: 0,
       retries: 0
     };
-    this.currentCity = '';
-    this.browser = null;
-    this.page = null;
     this.cityQueue = [...cities];
+    this.activeBrowsers = [];
   }
 
   showBanner() {
@@ -53,6 +52,7 @@ class ScraperManager {
         case 'q':
           console.log('\n🛑 Arrêt en cours...');
           this.isRunning = false;
+          await this.closeAllBrowsers();
           break;
         case 'p':
           this.isRunning = false;
@@ -71,10 +71,9 @@ class ScraperManager {
           break;
         case 'd':
           console.log('🔍 État actuel:', {
-            ville: this.currentCity,
+            villesRestantes: this.cityQueue.length,
             ...this.stats,
             isRunning: this.isRunning,
-            villesRestantes: this.cityQueue.length
           });
           break;
         case 'h':
@@ -92,13 +91,12 @@ class ScraperManager {
 • Doublons évités: ${this.stats.duplicates}
 • Erreurs: ${this.stats.errors}
 • Tentatives de récupération: ${this.stats.retries}
-• Ville en cours: ${this.currentCity}
 • Villes restantes: ${this.cityQueue.length}
     `);
   }
 
   async initBrowser() {
-    this.browser = await puppeteer.launch({
+    const browser = await puppeteer.launch({
       headless: 'new',
       defaultViewport: { width: 1920, height: 1080 },
       args: [
@@ -110,10 +108,10 @@ class ScraperManager {
         '--window-size=1920,1080'
       ]
     });
-    this.page = await this.browser.newPage();
-    
-    await this.page.setRequestInterception(true);
-    this.page.on('request', (req) => {
+    const page = await browser.newPage();
+
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
       if (['image', 'stylesheet', 'font'].includes(req.resourceType())) {
         req.abort();
       } else {
@@ -121,7 +119,8 @@ class ScraperManager {
       }
     });
 
-    await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36');
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36');
+    return { browser, page };
   }
 
   async loadExistingData() {
@@ -141,7 +140,7 @@ class ScraperManager {
           })
           .on('end', resolve);
       });
-      
+
       this.stats.total = this.existingData.size;
       console.log(`📂 ${this.stats.total} établissements chargés du CSV`);
     } catch (error) {
@@ -175,9 +174,9 @@ class ScraperManager {
     }
   }
 
-  async processEstablishment(element) {
+  async processEstablishment(page, element, city) {
     try {
-      const data = await this.page.evaluate(async (el) => {
+      const data = await page.evaluate(async (el) => {
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await new Promise(resolve => setTimeout(resolve, 300));
         el.click();
@@ -206,7 +205,7 @@ class ScraperManager {
       });
 
       if (data && data.name && data.address) {
-        data.city = this.currentCity;
+        data.city = city;
         await this.saveEstablishment(data);
         process.stdout.write(`\r✅ ${this.stats.new} établissements traités`);
       }
@@ -219,29 +218,24 @@ class ScraperManager {
   moveToNextCity() {
     this.cityQueue.shift();
     this.stats.duplicates = 0;
-    if (this.cityQueue.length > 0) {
-      this.currentCity = this.cityQueue[0];
-      console.log(`\n🏙️ Passage à la ville suivante: ${this.currentCity}`);
-    } else {
-      console.log('\n🏁 Toutes les villes ont été traitées');
-      this.isRunning = false;
-    }
   }
 
   async scrapeCity(city, retryCount = 0) {
+    const { browser, page } = await this.initBrowser();
+    this.activeBrowsers.push({ browser, page });
+
     try {
-      this.currentCity = city;
       console.log(`\n🏙️ Traitement de ${city} (Tentative ${retryCount + 1}/${MAX_RETRIES})`);
-  
-      await this.page.goto(`${searchUrl}${encodeURIComponent(city)}`, {
+
+      await page.goto(`${searchUrl}${encodeURIComponent(city)}`, {
         waitUntil: 'networkidle0',
         timeout: 90000
       });
 
       // Handle cookie consent
       try {
-        await this.page.waitForSelector('form:has(button[aria-label="Tout refuser"])', { timeout: 5000 });
-        await this.page.click('button[aria-label="Tout refuser"]');
+        await page.waitForSelector('form:has(button[aria-label="Tout refuser"])', { timeout: 5000 });
+        await page.click('button[aria-label="Tout refuser"]');
         await new Promise(r => setTimeout(r, 1000));
       } catch (cookieError) {
         console.log('Pas de bannière de cookies ou erreur lors de la gestion des cookies');
@@ -252,8 +246,8 @@ class ScraperManager {
 
       while (this.isRunning && sameCountIterations < 3 && this.stats.duplicates < MAX_DUPLICATES) {
         try {
-          const elements = await this.page.$$('.hfpxzc');
-          
+          const elements = await page.$$('.hfpxzc');
+
           if (elements.length === lastCount) {
             sameCountIterations++;
           } else {
@@ -263,10 +257,10 @@ class ScraperManager {
 
           for (const element of elements) {
             if (!this.isRunning || this.stats.duplicates >= MAX_DUPLICATES) break;
-            await this.processEstablishment(element);
+            await this.processEstablishment(page, element, city);
           }
 
-          await this.page.evaluate(() => {
+          await page.evaluate(() => {
             const resultsList = document.querySelector('.m6QErb');
             if (resultsList) resultsList.scrollTop = resultsList.scrollHeight;
           });
@@ -280,21 +274,22 @@ class ScraperManager {
 
       if (this.stats.duplicates >= MAX_DUPLICATES) {
         console.log(`\n🔄 ${MAX_DUPLICATES} doublons atteints pour ${city}`);
-        this.moveToNextCity();
       }
     } catch (error) {
       console.error(`\n❌ Erreur pour ${city}:`, error.message);
       this.stats.errors++;
-      
+
       if (retryCount < MAX_RETRIES - 1) {
         console.log(`Tentative de récupération... (${retryCount + 1}/${MAX_RETRIES})`);
         this.stats.retries++;
-        await this.initBrowser();
         await this.scrapeCity(city, retryCount + 1);
       } else {
-        console.log(`Échec après ${MAX_RETRIES} tentatives pour ${city}. Passage à la ville suivante.`);
-        this.moveToNextCity();
+        console.log(`Échec après ${MAX_RETRIES} tentatives pour ${city}.`);
       }
+    } finally {
+      await browser.close();
+      this.activeBrowsers = this.activeBrowsers.filter(b => b.browser !== browser);
+      this.moveToNextCity();
     }
   }
 
@@ -303,21 +298,27 @@ class ScraperManager {
       this.showBanner();
       await this.setupConsoleCommands();
       await this.loadExistingData();
-      await this.initBrowser();
 
       while (this.cityQueue.length > 0 && this.isRunning) {
-        await this.scrapeCity(this.cityQueue[0]);
-        // Add a random delay between cities to avoid rate limiting
+        const nextCities = this.cityQueue.slice(0, CONCURRENT_CITIES);
+        await Promise.all(nextCities.map(city => this.scrapeCity(city)));
         await new Promise(r => setTimeout(r, 5000 + Math.random() * 5000));
       }
     } catch (error) {
       console.error('❌ Erreur critique:', error.message);
     } finally {
-      if (this.browser) await this.browser.close();
+      await this.closeAllBrowsers();
       this.showStats();
       console.log('\n✨ Scraping terminé');
       process.exit(0);
     }
+  }
+
+  async closeAllBrowsers() {
+    for (const { browser } of this.activeBrowsers) {
+      await browser.close();
+    }
+    this.activeBrowsers = [];
   }
 }
 
