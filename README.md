@@ -1,12 +1,12 @@
 # Google Maps Scraper
 
-Ce projet permet de récupérer automatiquement des informations (nom, téléphone, adresse...) d’établissements sur Google Maps en fonction de différentes villes, puis de les enregistrer dans un fichier CSV.
+This project automatically collects business info (name, phone, address, etc.) from Google Maps based on different cities, and saves it into a CSV file.
 
-- Scraping automatisé
-- Multi-villes
-- Anti-doublons
-- Export CSV
+- ✅ Automated scraping  
+- 📍 Multi-city support  
+- 🔄 No duplicates  
+- 💾 CSV export  
 
-Lancez simplement :  
+Just run:  
 ```bash
 node script.js
