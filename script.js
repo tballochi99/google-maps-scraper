@@ -11,7 +11,7 @@ const CSV_FILE = 'establishments.csv';
 const CSV_HEADERS = ['name', 'phone', 'address', 'city', 'scrapedAt'];
 const MAX_DUPLICATES = 50;
 const MAX_RETRIES = 3;
-const CONCURRENT_CITIES = 3; // Nombre de villes à traiter en parallèle
+const CONCURRENT_CITIES = 3;
 
 class ScraperManager {
   constructor() {
